@@ -1,13 +1,20 @@
 """The V4 packs ComfyUI has loaded, and the routes they serve.
 
-ComfyUI's loader calls `add_pack` for each pack it loads and `remove_pack` when loading fails
-after that; its server calls `mount_routes` once it has added its own routes. Packs do not call
+ComfyUI's loader calls `add_pack` for each pack with a `comfy_entrypoint` it loads, and
+`remove_pack` when loading fails after that; its server calls `mount_routes` once it has added its
+own routes. `remove_pack` also takes away a pack running in its own process when that process
+keeps failing. Taking packs away is `flush_pack_resources`, which `remove_pack` calls for the
+packs of a path, and `flush_all_pack_resources`, which runs when ComfyUI exits. Packs do not call
 anything here.
 """
 
+import atexit
+import contextlib
 import logging
 import os
 import re
+import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple, get_args
@@ -17,6 +24,7 @@ from aiohttp.web_urldispatcher import DynamicResource
 
 from comfy_api._exceptions import InterruptProcessingException
 
+from . import _pack_processes
 from ._extension import ComfyExtension, Route, RouteRequest
 
 METHODS = get_args(Route.__annotations__["method"])
@@ -39,13 +47,23 @@ class _Pack:
     addresses: list[_Address] = field(default_factory=list)
     # (table, key, value) entries the loader made for this pack in its folder tables
     folders: list[tuple[dict[str, str], str, str]] = field(default_factory=list)
-    # node id: (class, display name) of a loaded pack's node this pack's node replaces
+    # node id: (class, display name) of the node, ComfyUI's or a loaded pack's, this pack's replaces
     replaced: dict[str, tuple[type, str | None]] = field(default_factory=dict)
 
 
 _packs: dict[tuple[str, str], _Pack] = {}
 # aiohttp takes no route once the application serves; `mount_routes` sets this.
 _serving = False
+# The web folders of V4 packs that ComfyUI serves, as `mount_routes` found them; aiohttp cannot
+# drop a route.
+_served_web: dict[str, str] = {}
+# Packs taken away whose node classes stay registered while a queued or running prompt uses one:
+# ComfyUI looks node classes up by id while it runs a prompt.
+_retired: list[_Pack] = []
+# The loader, the prompt thread (a pack disabled) and the host flush.
+_flushing = threading.Lock()
+# How often ComfyUI looks again whether the retired packs' nodes are still used.
+RETIRED_POLL = 1.0
 
 
 def _address(method: str, info: dict) -> _Address:
@@ -203,7 +221,6 @@ async def add_pack(
     its name and its folder name or a route is refused (see `ComfyExtension.get_routes`). What its
     `on_load` registered stays.
     """
-    import nodes
 
     if not isinstance(extension, ComfyExtension):
         return True
@@ -213,7 +230,7 @@ async def add_pack(
         node_ids = [node_cls.GET_SCHEMA().node_id for node_cls in node_list]
     except Exception:
         # The loader reports the error; the pack's folder entries go, as a refused pack's do.
-        _give_back_folders(module_path, name, folder)
+        _refuse(module_path, name, folder)
         raise
     pack = _Pack(name, folder, module_path, list(node_list))
     loaded = _packs.get((name, folder))
@@ -223,10 +240,25 @@ async def add_pack(
         problem = _add_routes(pack, routes)
     if problem is not None:
         logging.warning(f"Pack {name!r} in {module_path} is disabled: {problem}.")
-        _give_back_folders(module_path, name, folder)
+        _refuse(module_path, name, folder)
         return False
     pack.folders = _folders(module_path, name, folder)
-    pack.replaced = {
+    pack.replaced = _replaced(node_ids)
+    _packs[name, folder] = pack
+    return True
+
+
+def _refuse(module_path: str, name: str, folder: str) -> None:
+    """Undo what the loader did for a pack that is not loaded, and end its process if it has one."""
+    _give_back_folders(module_path, name, folder)
+    _pack_processes.unload(module_path)
+
+
+def _replaced(node_ids: list[str]) -> dict[str, tuple[type, str | None]]:
+    """The loaded nodes, with their display names, that nodes of these ids replace."""
+    import nodes
+
+    return {
         node_id: (
             nodes.NODE_CLASS_MAPPINGS[node_id],
             nodes.NODE_DISPLAY_NAME_MAPPINGS.get(node_id),
@@ -234,13 +266,11 @@ async def add_pack(
         for node_id in node_ids
         if node_id in nodes.NODE_CLASS_MAPPINGS
     }
-    _packs[name, folder] = pack
-    return True
 
 
 def _hand_on_replaced(pack: _Pack) -> None:
-    """A loaded pack that replaced one of `pack`'s nodes now replaces what `pack` replaced."""
-    for other in _packs.values():
+    """A pack that replaced one of `pack`'s nodes now replaces what `pack` replaced."""
+    for other in [*_packs.values(), *_retired]:
         for node_id, (node_cls, _) in list(other.replaced.items()):
             if node_cls not in pack.nodes:
                 continue
@@ -250,11 +280,31 @@ def _hand_on_replaced(pack: _Pack) -> None:
                 del other.replaced[node_id]
 
 
-def _remove(pack: _Pack) -> None:
+def _server():
+    from server import PromptServer
+
+    return getattr(PromptServer, "instance", None)
+
+
+def _in_use(node_classes: list[type]) -> bool:
+    """Whether a queued or running prompt uses one of these node classes."""
     import nodes
 
-    del _packs[pack.name, pack.folder]
-    _hand_on_replaced(pack)
+    server = _server()
+    if server is None:
+        return False
+    ids = {i for i, c in nodes.NODE_CLASS_MAPPINGS.items() if c in node_classes}
+    running, queued = server.prompt_queue.get_current_queue_volatile()
+    return any(
+        node.get("class_type") in ids
+        for item in running + queued
+        for node in item[2].values()
+    )
+
+
+def _remove_nodes(pack: _Pack) -> None:
+    import nodes
+
     listed = {node_cls for other in _packs.values() for node_cls in other.nodes}
     for node_id, node_cls in list(nodes.NODE_CLASS_MAPPINGS.items()):
         if node_cls not in pack.nodes or node_cls in listed:
@@ -266,17 +316,39 @@ def _remove(pack: _Pack) -> None:
         nodes.NODE_CLASS_MAPPINGS[node_id], display_name = pack.replaced[node_id]
         if display_name is not None:
             nodes.NODE_DISPLAY_NAME_MAPPINGS[node_id] = display_name
-    _give_back_folders(pack.module_path, pack.name, pack.folder)
+
+
+def _flush(packs: list[_Pack]) -> None:
+    with _flushing:
+        # Another thread may have taken one away meanwhile.
+        for pack in [p for p in packs if _packs.get((p.name, p.folder)) is p]:
+            _pack_processes.unload(pack.module_path)
+            del _packs[pack.name, pack.folder]
+            _hand_on_replaced(pack)
+            _give_back_folders(pack.module_path, pack.name, pack.folder)
+            _retired.append(pack)
+        for pack in [p for p in _retired if not _in_use(p.nodes)]:
+            _retired.remove(pack)
+            _remove_nodes(pack)
+        if _retired:
+            _look_again()
+
+
+def _look_again() -> None:
+    """Flush again in `RETIRED_POLL` seconds, on the server's loop, for the retired packs."""
+    loop = _server().loop
+    # A loop that has closed runs nothing more: ComfyUI is ending.
+    with contextlib.suppress(RuntimeError):
+        loop.call_soon_threadsafe(loop.call_later, RETIRED_POLL, _flush, [])
 
 
 def remove_pack(module_path: str) -> None:
-    """Disable the pack `add_pack` recorded from `module_path`: remove its nodes, putting back any
-    node of another pack they replaced, give back the loader's folder entries for it as `add_pack`
-    does on refusal, and never serve its routes. For a pack that fails to load after `add_pack`,
-    before ComfyUI serves.
+    """Disable the pack `add_pack` recorded from `module_path`, as `flush_pack_resources` does:
+    a pack that fails to load after `add_pack`, or whose process keeps failing.
     """
-    for pack in [p for p in _packs.values() if p.module_path == module_path]:
-        _remove(pack)
+    flush_pack_resources(
+        (p.name, p.folder) for p in _packs.values() if p.module_path == module_path
+    )
 
 
 def _served(app: web.Application) -> list[_Address]:
@@ -307,8 +379,10 @@ def _served(app: web.Application) -> list[_Address]:
     return served
 
 
-def _serve(route: Route):
+def _serve(pack: _Pack, route: Route):
     async def serve(request: web.Request) -> web.StreamResponse:
+        if _packs.get((pack.name, pack.folder)) is not pack:
+            raise web.HTTPNotFound()
         route_request = RouteRequest(
             method=request.method,
             path=request.path,
@@ -341,9 +415,22 @@ def mount_routes(server) -> None:
 
     A pack with a route that `server.app` already answers (a route of ComfyUI or of an older-API
     pack, a static folder, a sub-application) is disabled, with a warning, as `remove_pack` does;
-    what answered that route goes on answering it.
+    what answered that route goes on answering it. A route of a pack taken away later answers 404,
+    and so does its web folder.
+    Each `--pack-process` name that no loaded pack has is warned of.
     """
-    global _serving
+    global _serving, _served_web
+    import nodes
+
+    _pack_processes.warn_unmatched()
+    _served_web = {
+        key: value
+        for pack in _packs.values()
+        for table, key, value in pack.folders
+        if table is nodes.EXTENSION_WEB_DIRS
+    }
+    if _served_web:
+        server.app.middlewares.append(_unserved_web_folders)
     served = _served(server.app)
     for pack in list(_packs.values()):
         problem = _conflict(pack.addresses, served)
@@ -351,11 +438,50 @@ def mount_routes(server) -> None:
             logging.warning(
                 f"Pack {pack.name!r} in {pack.module_path} is disabled: {problem}."
             )
-            _remove(pack)
+            _flush([pack])
     server.app.add_routes(
-        web.route(route["method"], path, _serve(route))
+        web.route(route["method"], path, _serve(pack, route))
         for pack in _packs.values()
         for route in pack.routes
         for path in (route["path"], "/api" + route["path"])
     )
     _serving = True
+
+
+@web.middleware
+async def _unserved_web_folders(request: web.Request, handler):
+    """Answer 404 under the web folder of a V4 pack taken away since ComfyUI started serving."""
+    import nodes
+
+    prefix, _, rest = request.path.partition("/extensions/")
+    name = rest.partition("/")[0]
+    if prefix == "" and name in _served_web:
+        if nodes.EXTENSION_WEB_DIRS.get(name) != _served_web[name]:
+            raise web.HTTPNotFound()
+    return await handler(request)
+
+
+def flush_pack_resources(packs: Iterable[tuple[str, str]]) -> None:
+    """Take away the packs named by (name, folder name): end the process of one that runs in its
+    own, answer 404 to its routes and its web folder, and remove its nodes, putting back
+    any node of another pack they replaced. The nodes stay while a queued or running prompt uses
+    one of them, and go once none does: ComfyUI looks again every `RETIRED_POLL` seconds.
+
+    What a pack registered through `eng` or did when it was imported stays until ComfyUI restarts,
+    except that ending a pack's process undoes what the pack changed in the model folders.
+    Packs not loaded are ignored.
+    """
+    _flush([_packs[key] for key in set(packs) if key in _packs])
+
+
+def flush_all_pack_resources() -> None:
+    """Take away every V4 pack, as `flush_pack_resources` does."""
+    _flush(list(_packs.values()))
+
+
+@atexit.register
+def _unload_all() -> None:
+    """ComfyUI exits: take every pack away, and end the pack processes still loading, which no
+    pack stands for yet."""
+    flush_all_pack_resources()
+    _pack_processes.end_all()
